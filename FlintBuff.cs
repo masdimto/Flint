@@ -12,22 +12,17 @@ namespace FlintBuffPlugin
     public class FlintBuff : TerrariaPlugin
     {
         public override string Name => "FlintBuff";
-        public override System.Version Version => new System.Version(1, 0, 0);
+        public override System.Version Version => new System.Version(1, 1, 0);
         public override string Author => "CustomPlugin";
-        public override string Description => "Buff senjata Flint (Dead Cells): makin lama di-charge, scale (+0.1/detik) dan panjang trail (+0.1/detik) makin besar.";
-
-        private class GrowingWaveData
-        {
-            public int ProjIndex;
-            public int TicksLeft;
-            public float TargetScale;
-            public int Damage;
-        }
+        public override string Description => "Buff senjata Flint (Dead Cells): makin lama di-charge, scale senjata (+0.1/detik) dan panjang trail asli Flint (+0.1/detik) makin besar.";
 
         private bool[] isCharging = new bool[Main.maxPlayers];
         private int[] chargeTicks = new int[Main.maxPlayers];
         private int[] lastNotifiedSecond = new int[Main.maxPlayers];
-        private List<GrowingWaveData> activeWaves = new List<GrowingWaveData>();
+        private float[] activeBonus = new float[Main.maxPlayers];
+        private int[] releaseWindowTicks = new int[Main.maxPlayers];
+        private float[] originalItemScale = new float[Main.maxPlayers];
+        private HashSet<int> boostedProjectiles = new HashSet<int>();
 
         // Waktu charge dasar sebelum bonus mulai dihitung (0.6 detik = 36 tick)
         private const int BaseTriggerTicks = 36;
@@ -59,26 +54,29 @@ namespace FlintBuffPlugin
 
         private void CheckStatusCommand(CommandArgs args)
         {
-            args.Player.SendSuccessMessage("[FlintBuff] Aktif! Tahan serangan Flint: setiap 1 detik menambah scale +0.1 dan panjang trail +0.1.");
+            args.Player.SendSuccessMessage("[FlintBuff] Aktif! Tahan serangan Flint: setiap 1 detik menambah scale senjata +0.1 dan panjang trail asli +0.1.");
         }
 
         private void OnServerJoin(JoinEventArgs args)
         {
-            if (args.Who >= 0 && args.Who < Main.maxPlayers)
-            {
-                isCharging[args.Who] = false;
-                chargeTicks[args.Who] = 0;
-                lastNotifiedSecond[args.Who] = 0;
-            }
+            ResetPlayerState(args.Who);
         }
 
         private void OnServerLeave(LeaveEventArgs args)
         {
-            if (args.Who >= 0 && args.Who < Main.maxPlayers)
+            ResetPlayerState(args.Who);
+        }
+
+        private void ResetPlayerState(int plrIdx)
+        {
+            if (plrIdx >= 0 && plrIdx < Main.maxPlayers)
             {
-                isCharging[args.Who] = false;
-                chargeTicks[args.Who] = 0;
-                lastNotifiedSecond[args.Who] = 0;
+                isCharging[plrIdx] = false;
+                chargeTicks[plrIdx] = 0;
+                lastNotifiedSecond[plrIdx] = 0;
+                activeBonus[plrIdx] = 0f;
+                releaseWindowTicks[plrIdx] = 0;
+                originalItemScale[plrIdx] = 1f;
             }
         }
 
@@ -87,7 +85,6 @@ namespace FlintBuffPlugin
             if (item == null || item.IsAir)
                 return false;
 
-            // Cek nama item agar aman di semua versi OTAPI/TShock 1.4.5
             string rawName = Lang.GetItemNameValue(item.type);
             if (!string.IsNullOrEmpty(rawName) && rawName.Equals("Flint", StringComparison.OrdinalIgnoreCase))
                 return true;
@@ -100,8 +97,20 @@ namespace FlintBuffPlugin
 
         private void OnGameUpdate(EventArgs args)
         {
+            // Bersihkan daftar proyektil yang sudah tidak aktif
+            boostedProjectiles.RemoveWhere(idx => idx < 0 || idx >= Main.maxProjectiles || !Main.projectile[idx].active);
+
             for (int i = 0; i < Main.maxPlayers; i++)
             {
+                if (releaseWindowTicks[i] > 0)
+                {
+                    releaseWindowTicks[i]--;
+                    if (releaseWindowTicks[i] <= 0)
+                    {
+                        activeBonus[i] = 0f;
+                    }
+                }
+
                 TSPlayer tsPlayer = TShock.Players[i];
                 if (tsPlayer == null || !tsPlayer.Active || tsPlayer.TPlayer == null)
                     continue;
@@ -114,25 +123,38 @@ namespace FlintBuffPlugin
 
                 if (!IsFlintWeapon(heldItem))
                 {
-                    isCharging[i] = false;
-                    chargeTicks[i] = 0;
-                    lastNotifiedSecond[i] = 0;
+                    if (isCharging[i] || activeBonus[i] > 0f)
+                        ResetPlayerState(i);
                     continue;
                 }
 
-                // Pemain sedang menahan tombol serang (charging)
+                // 1. Pemain sedang menahan tombol serang (charging)
                 if (player.controlUseItem)
                 {
-                    isCharging[i] = true;
+                    if (!isCharging[i])
+                    {
+                        isCharging[i] = true;
+                        originalItemScale[i] = heldItem.scale > 0f ? heldItem.scale : 1f;
+                    }
+
                     chargeTicks[i]++;
 
-                    // Setelah charge awal terpicu (BaseTriggerTicks), hitung setiap kelipatan 1 detik (60 tick)
                     if (chargeTicks[i] >= BaseTriggerTicks)
                     {
                         int extraTicks = chargeTicks[i] - BaseTriggerTicks;
                         int extraSeconds = extraTicks / 60;
+                        float currentBonus = extraSeconds * 0.1f;
+                        activeBonus[i] = currentBonus;
 
-                        // Efek visual indikator di pemain setiap kali naik +1 detik (+0.1 scale & +0.1 trail)
+                        // Perbesar scale senjata Flint secara real-time saat di-charge
+                        float targetItemScale = originalItemScale[i] + currentBonus;
+                        if (Math.Abs(heldItem.scale - targetItemScale) > 0.01f)
+                        {
+                            heldItem.scale = targetItemScale;
+                            NetMessage.SendData((int)PacketTypes.PlayerSlot, -1, -1, null, i, player.selectedItem);
+                        }
+
+                        // Tanda percikan api di atas kepala pemain setiap naik 1 detik (+0.1)
                         if (extraSeconds > lastNotifiedSecond[i])
                         {
                             lastNotifiedSecond[i] = extraSeconds;
@@ -142,56 +164,66 @@ namespace FlintBuffPlugin
                 }
                 else
                 {
-                    // Pemain melepas tombol serang
+                    // 2. Pemain melepas tombol serang (ayunan & trail asli Flint keluar)
                     if (isCharging[i])
                     {
                         if (chargeTicks[i] >= BaseTriggerTicks)
                         {
                             int extraTicks = chargeTicks[i] - BaseTriggerTicks;
-                            // Setiap 1 detik (60 tick) = +0.1 scale & +0.1 panjang trail
-                            float bonusMultiplier = (extraTicks / 60) * 0.1f;
-                            ReleaseChargedFlintWave(player, heldItem, bonusMultiplier);
+                            activeBonus[i] = (extraTicks / 60) * 0.1f;
+                            // Buka jendela 30 tick (0.5 detik) untuk menangkap seluruh proyektil ayunan & trail asli Flint yang baru muncul
+                            releaseWindowTicks[i] = 30;
+                        }
+                        else
+                        {
+                            activeBonus[i] = 0f;
+                            heldItem.scale = originalItemScale[i];
+                            NetMessage.SendData((int)PacketTypes.PlayerSlot, -1, -1, null, i, player.selectedItem);
                         }
 
                         isCharging[i] = false;
                         chargeTicks[i] = 0;
                         lastNotifiedSecond[i] = 0;
                     }
-                }
-            }
-
-            // Update proyektil gelombang api Flint yang aktif (sinkronisasi scale & damage)
-            for (int k = activeWaves.Count - 1; k >= 0; k--)
-            {
-                GrowingWaveData wave = activeWaves[k];
-                wave.TicksLeft--;
-
-                if (wave.ProjIndex < 0 || wave.ProjIndex >= Main.maxProjectiles)
-                {
-                    activeWaves.RemoveAt(k);
-                    continue;
-                }
-
-                Projectile proj = Main.projectile[wave.ProjIndex];
-                if (wave.TicksLeft <= 0 || !proj.active)
-                {
-                    activeWaves.RemoveAt(k);
-                    continue;
-                }
-
-                proj.scale = wave.TargetScale;
-
-                // Berikan damage gelombang api ke musuh yang disentuh
-                if (wave.TicksLeft % 6 == 0)
-                {
-                    for (int n = 0; n < Main.maxNPCs; n++)
+                    else if (releaseWindowTicks[i] <= 0 && Math.Abs(heldItem.scale - originalItemScale[i]) > 0.01f)
                     {
-                        NPC npc = Main.npc[n];
-                        if (npc.active && !npc.friendly && !npc.dontTakeDamage && proj.Hitbox.Intersects(npc.Hitbox))
+                        // Kembalikan ukuran senjata ke normal setelah ayunan selesai
+                        heldItem.scale = originalItemScale[i];
+                        NetMessage.SendData((int)PacketTypes.PlayerSlot, -1, -1, null, i, player.selectedItem);
+                    }
+                }
+
+                // 3. Perbesar scale & perpanjang trail proyektil ASLI milik senjata Flint (baik saat ditahan maupun dilepas)
+                float bonus = activeBonus[i];
+                if (bonus > 0f && (isCharging[i] || releaseWindowTicks[i] > 0))
+                {
+                    for (int p = 0; p < Main.maxProjectiles; p++)
+                    {
+                        Projectile proj = Main.projectile[p];
+                        if (!proj.active || proj.owner != i)
+                            continue;
+
+                        // Abaikan percikan api indikator di atas kepala pemain
+                        if (proj.type == ProjectileID.MolotovFire)
+                            continue;
+
+                        // Terapkan pembesaran scale (+0.1/detik) dan perpanjangan trail (+0.1/detik) pada proyektil asli Flint
+                        if (!boostedProjectiles.Contains(p))
                         {
-                            npc.StrikeNPC(wave.Damage, 6f, proj.direction);
-                            NetMessage.SendData((int)PacketTypes.NpcStrike, -1, -1, null, npc.whoAmI, wave.Damage, 6f, proj.direction, 0);
-                            npc.AddBuff(BuffID.OnFire3, 180);
+                            boostedProjectiles.Add(p);
+
+                            float scaleMultiplier = 1.0f + bonus;
+                            proj.scale *= scaleMultiplier;
+                            proj.width = (int)Math.Round(proj.width * scaleMultiplier);
+                            proj.height = (int)Math.Round(proj.height * scaleMultiplier);
+
+                            // Perpanjang durasi & jangkauan rambat trail asli Flint (+0.1 per detik)
+                            proj.timeLeft = (int)Math.Round(proj.timeLeft * scaleMultiplier);
+                            proj.velocity *= (1.0f + bonus * 0.5f);
+                            proj.damage = (int)Math.Round(proj.damage * (1.0f + bonus));
+                            proj.netUpdate = true;
+
+                            NetMessage.SendData((int)PacketTypes.ProjectileNew, -1, -1, null, p);
                         }
                     }
                 }
@@ -200,7 +232,6 @@ namespace FlintBuffPlugin
 
         private void SpawnChargePulseVisual(Player player, int level)
         {
-            // Memunculkan kilau api singkat di tubuh pemain sebagai tanda charge bertambah +0.1
             int visualIdx = Projectile.NewProjectile(
                 Projectile.GetNoneSource(),
                 player.Center + new Vector2(0f, -24f),
@@ -220,57 +251,6 @@ namespace FlintBuffPlugin
                 p.scale = 1.0f + (level * 0.1f);
                 p.timeLeft = 18;
                 NetMessage.SendData((int)PacketTypes.ProjectileNew, -1, -1, null, visualIdx);
-            }
-        }
-
-        private void ReleaseChargedFlintWave(Player player, Item heldItem, float bonusMultiplier)
-        {
-            float finalScale = 1.0f + bonusMultiplier;
-            float trailLengthFactor = 1.0f + bonusMultiplier;
-
-            // Panjang gelombang (jumlah segmen trail merambat ke depan) bertambah seiring bonus +0.1/detik
-            int baseSegments = 5;
-            int totalSegments = Math.Max(5, (int)Math.Round(baseSegments * trailLengthFactor));
-            float stepDistance = 36f * finalScale;
-
-            int baseDamage = player.GetWeaponDamage(heldItem);
-            int finalDamage = Math.Max(1, (int)(baseDamage * (1.25f + bonusMultiplier)));
-
-            for (int s = 1; s <= totalSegments; s++)
-            {
-                Vector2 spawnPos = player.Bottom + new Vector2(player.direction * (s * stepDistance), -18f * finalScale);
-                Vector2 velocity = new Vector2(player.direction * (6f + bonusMultiplier * 2f), 0f);
-
-                int projIdx = Projectile.NewProjectile(
-                    Projectile.GetNoneSource(),
-                    spawnPos,
-                    velocity,
-                    ProjectileID.DD2FlameBurstTowerT2Shot,
-                    finalDamage,
-                    heldItem.knockBack,
-                    Main.maxPlayers
-                );
-
-                if (projIdx >= 0 && projIdx < Main.maxProjectiles)
-                {
-                    Projectile proj = Main.projectile[projIdx];
-                    proj.friendly = true;
-                    proj.hostile = false;
-                    proj.tileCollide = false;
-                    proj.scale = finalScale;
-                    proj.width = (int)(32 * finalScale);
-                    proj.height = (int)(32 * finalScale);
-                    proj.timeLeft = 22 + (s * 3); // Muncul beruntun membentuk trail panjang ke depan
-                    NetMessage.SendData((int)PacketTypes.ProjectileNew, -1, -1, null, projIdx);
-
-                    activeWaves.Add(new GrowingWaveData
-                    {
-                        ProjIndex = projIdx,
-                        TicksLeft = proj.timeLeft,
-                        TargetScale = finalScale,
-                        Damage = finalDamage
-                    });
-                }
             }
         }
     }
